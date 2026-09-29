@@ -13,7 +13,7 @@ from agent_tools import (
     plot_distribution, get_data_quality_score
 )
 
-MODEL = "gemini-2.0-flash"
+MODEL = "gemini-2.5-flash"
 
 
 def run_auto_eda(df: pd.DataFrame, schema_info: dict) -> dict:
