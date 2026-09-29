@@ -86,7 +86,7 @@ if "df" not in st.session_state:
 # ---------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ Setup")
-    api_key = st.text_input("Gemini API Key", type="password", help="Get one free at aistudio.google.com")
+    api_key = st.secrets["GEMINI_API_KEY"]
     uploaded_file = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
 
     if uploaded_file is not None and st.session_state.df is None:
