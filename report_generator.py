@@ -15,10 +15,8 @@ from agent_tools import (
     get_summary_stats, detect_outliers, plot_correlation_heatmap,
     plot_distribution, get_data_quality_score
 )
+from model_selector import get_best_available_model
 
-# Primary model, and a fallback to try if the primary is overloaded/unavailable.
-PRIMARY_MODEL = "gemini-flash-latest"
-FALLBACK_MODEL = "gemini-2.5-flash"
 MAX_RETRIES = 3
 
 
@@ -59,6 +57,7 @@ def generate_written_summary(schema_info: dict, findings: dict, api_key: str = N
     secondary model if the primary keeps failing.
     """
     client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
+    model_name = get_best_available_model(client)
 
     prompt = (
         "Here is the schema and exploratory analysis findings for a dataset. "
@@ -69,17 +68,16 @@ def generate_written_summary(schema_info: dict, findings: dict, api_key: str = N
     )
 
     last_error = None
-    for model in (PRIMARY_MODEL, FALLBACK_MODEL):
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = client.models.generate_content(model=model, contents=prompt)
-                return response.text
-            except genai_errors.ServerError as e:
-                last_error = e
-                time.sleep(2 * (attempt + 1))  # brief backoff before retrying
-            except genai_errors.ClientError as e:
-                # 4xx errors (bad key, bad request) won't fix themselves on retry
-                raise RuntimeError(f"Gemini request failed: {e}") from e
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.models.generate_content(model=model_name, contents=prompt)
+            return response.text
+        except genai_errors.ServerError as e:
+            last_error = e
+            time.sleep(2 * (attempt + 1))  # brief backoff before retrying
+        except genai_errors.ClientError as e:
+            # 4xx errors (bad key, bad request) won't fix themselves on retry
+            raise RuntimeError(f"Gemini request failed: {e}") from e
 
     raise RuntimeError(
         "Gemini's servers are currently unavailable after multiple retries. "
