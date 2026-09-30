@@ -86,7 +86,10 @@ if "df" not in st.session_state:
 # ---------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ Setup")
-    api_key = st.secrets["GEMINI_API_KEY"]
+    try:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    except (KeyError, FileNotFoundError):
+        api_key = st.text_input("Gemini API Key", type="password", help="Get one free at aistudio.google.com")
     uploaded_file = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
 
     if uploaded_file is not None and st.session_state.df is None:
@@ -154,14 +157,17 @@ with tab_report:
         if not api_key:
             st.error("Enter your Gemini API key in the sidebar first.")
         else:
-            with st.spinner("Running exploratory analysis..."):
-                findings = run_auto_eda(df, schema_info)
-                summary = generate_written_summary(schema_info, findings, api_key)
-            st.markdown(summary)
-            cols = st.columns(2)
-            for i, chart_path in enumerate(findings["charts"]):
-                cols[i % 2].image(chart_path)
-            st.download_button("⬇️ Download report as text", summary, file_name="eda_report.txt")
+            try:
+                with st.spinner("Running exploratory analysis..."):
+                    findings = run_auto_eda(df, schema_info)
+                    summary = generate_written_summary(schema_info, findings, api_key)
+                st.markdown(summary)
+                cols = st.columns(2)
+                for i, chart_path in enumerate(findings["charts"]):
+                    cols[i % 2].image(chart_path)
+                st.download_button("⬇️ Download report as text", summary, file_name="eda_report.txt")
+            except RuntimeError as e:
+                st.error(f"⚠️ Couldn't generate the report: {e}")
 
 # --- Tab 2: interactive chat with the agent ---
 with tab_chat:
@@ -186,16 +192,18 @@ with tab_chat:
                 st.markdown(query_to_run)
 
             with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    agent = DataAnalysisAgent(df, schema_info, api_key)
-                    result = agent.run(query_to_run, st.session_state.agent_messages)
-                st.markdown(result["answer"])
-                for chart_path in result["chart_paths"]:
-                    st.image(chart_path)
-
-            st.session_state.chat_history.append(("assistant", result["answer"]))
-            st.session_state.agent_messages = result["history"]
-            history.add_entry(schema_info, query_to_run, result["answer"])
+                try:
+                    with st.spinner("Thinking..."):
+                        agent = DataAnalysisAgent(df, schema_info, api_key)
+                        result = agent.run(query_to_run, st.session_state.agent_messages)
+                    st.markdown(result["answer"])
+                    for chart_path in result["chart_paths"]:
+                        st.image(chart_path)
+                    st.session_state.chat_history.append(("assistant", result["answer"]))
+                    st.session_state.agent_messages = result["history"]
+                    history.add_entry(schema_info, query_to_run, result["answer"])
+                except RuntimeError as e:
+                    st.error(f"⚠️ Couldn't get a response: {e}")
 
     if st.session_state.chat_history:
         chat_text = "\n\n".join(f"{role.upper()}: {text}" for role, text in st.session_state.chat_history)
