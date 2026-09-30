@@ -2,10 +2,13 @@
 Phase 6 (updated): Report Generation — Gemini via the new google-genai SDK
 Runs a fixed exploratory analysis pass over the whole dataset and asks
 Gemini to synthesize the findings into a written summary.
+Includes retry + fallback-model handling for transient server errors.
 """
 
 import os
+import time
 from google import genai
+from google.genai import errors as genai_errors
 import pandas as pd
 
 from agent_tools import (
@@ -13,7 +16,10 @@ from agent_tools import (
     plot_distribution, get_data_quality_score
 )
 
-MODEL = "gemini-flash-latest"
+# Primary model, and a fallback to try if the primary is overloaded/unavailable.
+PRIMARY_MODEL = "gemini-flash-latest"
+FALLBACK_MODEL = "gemini-2.5-flash"
+MAX_RETRIES = 3
 
 
 def run_auto_eda(df: pd.DataFrame, schema_info: dict) -> dict:
@@ -49,7 +55,8 @@ def run_auto_eda(df: pd.DataFrame, schema_info: dict) -> dict:
 def generate_written_summary(schema_info: dict, findings: dict, api_key: str = None) -> str:
     """
     Sends the raw findings to Gemini and asks for a written, human-readable
-    EDA summary — the kind you'd put at the top of a report.
+    EDA summary. Retries on transient server errors, then falls back to a
+    secondary model if the primary keeps failing.
     """
     client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
 
@@ -61,5 +68,21 @@ def generate_written_summary(schema_info: dict, findings: dict, api_key: str = N
         f"SCHEMA:\n{schema_info}\n\nFINDINGS:\n{findings}"
     )
 
-    response = client.models.generate_content(model=MODEL, contents=prompt)
-    return response.text
+    last_error = None
+    for model in (PRIMARY_MODEL, FALLBACK_MODEL):
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = client.models.generate_content(model=model, contents=prompt)
+                return response.text
+            except genai_errors.ServerError as e:
+                last_error = e
+                time.sleep(2 * (attempt + 1))  # brief backoff before retrying
+            except genai_errors.ClientError as e:
+                # 4xx errors (bad key, bad request) won't fix themselves on retry
+                raise RuntimeError(f"Gemini request failed: {e}") from e
+
+    raise RuntimeError(
+        "Gemini's servers are currently unavailable after multiple retries. "
+        "This is usually temporary — please try again in a minute. "
+        f"(Last error: {last_error})"
+    )
