@@ -2,21 +2,22 @@
 Phase 5 (updated): Agent Reasoning Loop — Gemini via the new google-genai SDK
 Same ReAct pattern as before: user question -> Gemini decides which
 tool(s) to call -> tool runs -> result fed back -> repeat until Gemini
-gives a final answer.
+gives a final answer. Includes retry + fallback-model handling.
 """
 
 import os
+import time
 from google import genai
 from google.genai import types
+from google.genai import errors as genai_errors
 import pandas as pd
 
 from agent_tools import GEMINI_TOOL_DECLARATIONS, call_tool
 
-# "gemini-flash-latest" is an auto-updated alias that always points to
-# Google's current stable Flash model, so this won't break again when
-# a specific dated model gets retired.
-MODEL = "gemini-flash-latest"
-MAX_TURNS = 6  # safety cap so the loop can't run forever
+PRIMARY_MODEL = "gemini-flash-latest"
+FALLBACK_MODEL = "gemini-2.5-flash"
+MAX_TURNS = 6       # safety cap on reasoning loop iterations
+MAX_RETRIES = 3      # retries per request on transient server errors
 
 
 class DataAnalysisAgent:
@@ -38,48 +39,66 @@ class DataAnalysisAgent:
             "If a chart was generated, mention what it shows."
         )
 
+    def _send_with_retry(self, chat, message):
+        """Send a chat message, retrying on transient server errors."""
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                return chat.send_message(message)
+            except genai_errors.ServerError as e:
+                last_error = e
+                time.sleep(2 * (attempt + 1))
+            except genai_errors.ClientError as e:
+                raise RuntimeError(f"Gemini request failed: {e}") from e
+        raise RuntimeError(
+            "Gemini's servers are currently unavailable after multiple retries. "
+            f"Please try again shortly. (Last error: {last_error})"
+        )
+
     def run(self, user_query: str, conversation_history: list = None) -> dict:
         """
         Run one query through the agent loop.
         Returns {"answer": str, "chart_paths": [...], "history": [...]}
-        conversation_history is a google-genai chat history list, used to
-        keep multi-turn context.
         """
-        chat = self.client.chats.create(
-            model=MODEL,
-            config=types.GenerateContentConfig(
-                tools=[self.tool],
-                system_instruction=self._system_prompt(),
-            ),
-            history=conversation_history or [],
-        )
-        self.chart_paths = []
-
-        response = chat.send_message(user_query)
-
-        for _ in range(MAX_TURNS):
-            parts = response.candidates[0].content.parts
-            function_calls = [p.function_call for p in parts if p.function_call]
-
-            if not function_calls:
-                final_text = response.text
-                return {"answer": final_text, "chart_paths": self.chart_paths, "history": chat.get_history()}
-
-            # Execute every tool call Gemini requested in this turn
-            function_response_parts = []
-            for fc in function_calls:
-                args = dict(fc.args)
-                result = call_tool(fc.name, args, self.df)
-                if isinstance(result, dict) and "chart_path" in result:
-                    self.chart_paths.append(result["chart_path"])
-                function_response_parts.append(
-                    types.Part.from_function_response(name=fc.name, response={"result": result})
+        for model in (PRIMARY_MODEL, FALLBACK_MODEL):
+            try:
+                chat = self.client.chats.create(
+                    model=model,
+                    config=types.GenerateContentConfig(
+                        tools=[self.tool],
+                        system_instruction=self._system_prompt(),
+                    ),
+                    history=conversation_history or [],
                 )
+                self.chart_paths = []
+                response = self._send_with_retry(chat, user_query)
 
-            response = chat.send_message(function_response_parts)
+                for _ in range(MAX_TURNS):
+                    parts = response.candidates[0].content.parts
+                    function_calls = [p.function_call for p in parts if p.function_call]
 
-        return {
-            "answer": "I wasn't able to reach a final answer within the step limit — try a more specific question.",
-            "chart_paths": self.chart_paths,
-            "history": chat.get_history(),
-        }
+                    if not function_calls:
+                        return {"answer": response.text, "chart_paths": self.chart_paths,
+                                "history": chat.get_history()}
+
+                    function_response_parts = []
+                    for fc in function_calls:
+                        args = dict(fc.args)
+                        result = call_tool(fc.name, args, self.df)
+                        if isinstance(result, dict) and "chart_path" in result:
+                            self.chart_paths.append(result["chart_path"])
+                        function_response_parts.append(
+                            types.Part.from_function_response(name=fc.name, response={"result": result})
+                        )
+
+                    response = self._send_with_retry(chat, function_response_parts)
+
+                return {
+                    "answer": "I wasn't able to reach a final answer within the step limit — try a more specific question.",
+                    "chart_paths": self.chart_paths,
+                    "history": chat.get_history(),
+                }
+            except RuntimeError:
+                if model == PRIMARY_MODEL:
+                    continue  # try the fallback model
+                raise  # both models failed — surface the error
