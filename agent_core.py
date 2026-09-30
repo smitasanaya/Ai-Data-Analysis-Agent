@@ -2,7 +2,9 @@
 Phase 5 (updated): Agent Reasoning Loop — Gemini via the new google-genai SDK
 Same ReAct pattern as before: user question -> Gemini decides which
 tool(s) to call -> tool runs -> result fed back -> repeat until Gemini
-gives a final answer. Includes retry + fallback-model handling.
+gives a final answer. Model is picked dynamically per API key (see
+model_selector.py) instead of a hardcoded name, and requests retry on
+transient server errors.
 """
 
 import os
@@ -13,9 +15,8 @@ from google.genai import errors as genai_errors
 import pandas as pd
 
 from agent_tools import GEMINI_TOOL_DECLARATIONS, call_tool
+from model_selector import get_best_available_model
 
-PRIMARY_MODEL = "gemini-flash-latest"
-FALLBACK_MODEL = "gemini-2.5-flash"
 MAX_TURNS = 6       # safety cap on reasoning loop iterations
 MAX_RETRIES = 3      # retries per request on transient server errors
 
@@ -23,6 +24,7 @@ MAX_RETRIES = 3      # retries per request on transient server errors
 class DataAnalysisAgent:
     def __init__(self, df: pd.DataFrame, schema_info: dict, api_key: str = None):
         self.client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
+        self.model_name = get_best_available_model(self.client)
         self.df = df
         self.schema_info = schema_info
         self.tool = types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)
@@ -60,45 +62,39 @@ class DataAnalysisAgent:
         Run one query through the agent loop.
         Returns {"answer": str, "chart_paths": [...], "history": [...]}
         """
-        for model in (PRIMARY_MODEL, FALLBACK_MODEL):
-            try:
-                chat = self.client.chats.create(
-                    model=model,
-                    config=types.GenerateContentConfig(
-                        tools=[self.tool],
-                        system_instruction=self._system_prompt(),
-                    ),
-                    history=conversation_history or [],
+        chat = self.client.chats.create(
+            model=self.model_name,
+            config=types.GenerateContentConfig(
+                tools=[self.tool],
+                system_instruction=self._system_prompt(),
+            ),
+            history=conversation_history or [],
+        )
+        self.chart_paths = []
+        response = self._send_with_retry(chat, user_query)
+
+        for _ in range(MAX_TURNS):
+            parts = response.candidates[0].content.parts
+            function_calls = [p.function_call for p in parts if p.function_call]
+
+            if not function_calls:
+                return {"answer": response.text, "chart_paths": self.chart_paths,
+                        "history": chat.get_history()}
+
+            function_response_parts = []
+            for fc in function_calls:
+                args = dict(fc.args)
+                result = call_tool(fc.name, args, self.df)
+                if isinstance(result, dict) and "chart_path" in result:
+                    self.chart_paths.append(result["chart_path"])
+                function_response_parts.append(
+                    types.Part.from_function_response(name=fc.name, response={"result": result})
                 )
-                self.chart_paths = []
-                response = self._send_with_retry(chat, user_query)
 
-                for _ in range(MAX_TURNS):
-                    parts = response.candidates[0].content.parts
-                    function_calls = [p.function_call for p in parts if p.function_call]
+            response = self._send_with_retry(chat, function_response_parts)
 
-                    if not function_calls:
-                        return {"answer": response.text, "chart_paths": self.chart_paths,
-                                "history": chat.get_history()}
-
-                    function_response_parts = []
-                    for fc in function_calls:
-                        args = dict(fc.args)
-                        result = call_tool(fc.name, args, self.df)
-                        if isinstance(result, dict) and "chart_path" in result:
-                            self.chart_paths.append(result["chart_path"])
-                        function_response_parts.append(
-                            types.Part.from_function_response(name=fc.name, response={"result": result})
-                        )
-
-                    response = self._send_with_retry(chat, function_response_parts)
-
-                return {
-                    "answer": "I wasn't able to reach a final answer within the step limit — try a more specific question.",
-                    "chart_paths": self.chart_paths,
-                    "history": chat.get_history(),
-                }
-            except RuntimeError:
-                if model == PRIMARY_MODEL:
-                    continue  # try the fallback model
-                raise  # both models failed — surface the error
+        return {
+            "answer": "I wasn't able to reach a final answer within the step limit — try a more specific question.",
+            "chart_paths": self.chart_paths,
+            "history": chat.get_history(),
+        }
