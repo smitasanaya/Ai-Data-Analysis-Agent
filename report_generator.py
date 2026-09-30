@@ -1,11 +1,11 @@
 """
-Phase 6 (updated): Report Generation — now powered by Gemini
+Phase 6 (updated): Report Generation — Gemini via the new google-genai SDK
 Runs a fixed exploratory analysis pass over the whole dataset and asks
 Gemini to synthesize the findings into a written summary.
 """
 
 import os
-import google.generativeai as genai
+from google import genai
 import pandas as pd
 
 from agent_tools import (
@@ -13,7 +13,7 @@ from agent_tools import (
     plot_distribution, get_data_quality_score
 )
 
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-flash-latest"
 
 
 def run_auto_eda(df: pd.DataFrame, schema_info: dict) -> dict:
@@ -51,8 +51,7 @@ def generate_written_summary(schema_info: dict, findings: dict, api_key: str = N
     Sends the raw findings to Gemini and asks for a written, human-readable
     EDA summary — the kind you'd put at the top of a report.
     """
-    genai.configure(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
-    model = genai.GenerativeModel(MODEL)
+    client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
 
     prompt = (
         "Here is the schema and exploratory analysis findings for a dataset. "
@@ -62,5 +61,5 @@ def generate_written_summary(schema_info: dict, findings: dict, api_key: str = N
         f"SCHEMA:\n{schema_info}\n\nFINDINGS:\n{findings}"
     )
 
-    response = model.generate_content(prompt)
+    response = client.models.generate_content(model=MODEL, contents=prompt)
     return response.text
