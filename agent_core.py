@@ -1,30 +1,30 @@
 """
-Phase 5 (updated): Agent Reasoning Loop — now powered by Gemini
+Phase 5 (updated): Agent Reasoning Loop — Gemini via the new google-genai SDK
 Same ReAct pattern as before: user question -> Gemini decides which
 tool(s) to call -> tool runs -> result fed back -> repeat until Gemini
-gives a final answer. Uses Gemini's native function-calling API.
+gives a final answer.
 """
 
 import os
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import pandas as pd
 
 from agent_tools import GEMINI_TOOL_DECLARATIONS, call_tool
 
-MODEL = "gemini-2.0-flash"
+# "gemini-flash-latest" is an auto-updated alias that always points to
+# Google's current stable Flash model, so this won't break again when
+# a specific dated model gets retired.
+MODEL = "gemini-flash-latest"
 MAX_TURNS = 6  # safety cap so the loop can't run forever
 
 
 class DataAnalysisAgent:
     def __init__(self, df: pd.DataFrame, schema_info: dict, api_key: str = None):
-        genai.configure(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
+        self.client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
         self.df = df
         self.schema_info = schema_info
-        self.model = genai.GenerativeModel(
-            model_name=MODEL,
-            tools=[{"function_declarations": GEMINI_TOOL_DECLARATIONS}],
-            system_instruction=self._system_prompt(),
-        )
+        self.tool = types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)
         self.chart_paths = []
 
     def _system_prompt(self) -> str:
@@ -42,10 +42,17 @@ class DataAnalysisAgent:
         """
         Run one query through the agent loop.
         Returns {"answer": str, "chart_paths": [...], "history": [...]}
-        conversation_history is a Gemini-format chat history (list of
-        {"role": ..., "parts": [...]}), used to keep multi-turn context.
+        conversation_history is a google-genai chat history list, used to
+        keep multi-turn context.
         """
-        chat = self.model.start_chat(history=conversation_history or [])
+        chat = self.client.chats.create(
+            model=MODEL,
+            config=types.GenerateContentConfig(
+                tools=[self.tool],
+                system_instruction=self._system_prompt(),
+            ),
+            history=conversation_history or [],
+        )
         self.chart_paths = []
 
         response = chat.send_message(user_query)
@@ -56,7 +63,7 @@ class DataAnalysisAgent:
 
             if not function_calls:
                 final_text = response.text
-                return {"answer": final_text, "chart_paths": self.chart_paths, "history": chat.history}
+                return {"answer": final_text, "chart_paths": self.chart_paths, "history": chat.get_history()}
 
             # Execute every tool call Gemini requested in this turn
             function_response_parts = []
@@ -66,12 +73,7 @@ class DataAnalysisAgent:
                 if isinstance(result, dict) and "chart_path" in result:
                     self.chart_paths.append(result["chart_path"])
                 function_response_parts.append(
-                    genai.protos.Part(
-                        function_response=genai.protos.FunctionResponse(
-                            name=fc.name,
-                            response={"result": result},
-                        )
-                    )
+                    types.Part.from_function_response(name=fc.name, response={"result": result})
                 )
 
             response = chat.send_message(function_response_parts)
@@ -79,5 +81,5 @@ class DataAnalysisAgent:
         return {
             "answer": "I wasn't able to reach a final answer within the step limit — try a more specific question.",
             "chart_paths": self.chart_paths,
-            "history": chat.history,
+            "history": chat.get_history(),
         }
